@@ -1,0 +1,21 @@
+# Secrets and local environment
+google_credentials.json
+env_pip_freeze.txt
+.claude/
+
+# Generated outputs and archives
+runs/
+results/
+archive/
+governor/
+__pycache__/
+*/__pycache__/
+*.pyc
+*.pyo
+*.log
+*.csv
+*.tar.gz
+
+# Keep the one documentation text file we want to publish
+*.txt
+!chapter3_methodology_answers.txt

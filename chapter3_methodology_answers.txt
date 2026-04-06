@@ -1,0 +1,377 @@
+================================================================================
+CHAPTER 3: METHODOLOGY -- FILLED CHECKLIST
+Generated from training scripts, logs, and system inspection
+================================================================================
+
+================================================================================
+SECTION 3.2: EXPERIMENTAL PLATFORM
+================================================================================
+
+SOFTWARE STACK:
+  JetPack version:        R36 revision 4.7 (L4T 36.4.7, released Sep 2025)
+  Ubuntu:                 22.04.5 LTS (Jammy Jellyfish)
+  CUDA:                   12.6 (V12.6.68)
+  PyTorch:                2.5.0a0+872d972e41.nv24.08 (NVIDIA Jetson build)
+  Transformers:           4.38.2 (HuggingFace)
+  Python:                 3.10.12
+
+GPU SPECIFICATIONS:
+  Architecture:           Ampere (GA10B)
+  CUDA cores:             2048
+  Tensor cores:           64
+  CUDA compute capability: 8.7
+
+MEMORY SPECIFICATIONS:
+  Capacity:               64 GB LPDDR5
+  Bandwidth:              204 GB/s
+  Memory type:            Unified (shared between CPU and GPU -- no discrete VRAM)
+
+POWER MODES (from /etc/nvpmodel.conf):
+  Mode 0 -- MAXN:         No power cap (TPC_PG_MASK=0, all TPC enabled)
+                          GPU runs at full dynamic frequency up to 1300 MHz
+  Mode 2 -- MODE_30W:     30W system power cap (TPC_PG_MASK=240, partial TPC gating)
+                          GPU frequency dynamically constrained under 30W budget
+  Mode 1 -- MODE_15W:     15W system power cap
+  Mode 3 -- MODE_50W:     50W system power cap
+  Default at boot:        Mode 2 (MODE_30W) per /etc/nvpmodel.conf
+
+CPU FREQUENCY:
+  Range:                  115.2 MHz -- 2201.6 MHz
+  Steps:                  29 discrete frequency points
+  Control:                NOT manually controlled; left under system cpufreq governor
+                          Reflects real-world deployment scenario
+
+GPU FREQUENCY:
+  Range:                  306 -- 1300 MHz (1300.5 MHz exact)
+  Number of steps:        11 discrete levels
+  All steps (MHz):        306, 408, 510, 612, 714, 816, 918, 1020, 1122, 1224, 1300
+  Spacing:                ~102 MHz (approximately equal; hardware-defined)
+  Control method:         Linux devfreq sysfs interface:
+                            /sys/class/devfreq/17000000.gpu/governor -> "userspace"
+                            /sys/class/devfreq/17000000.gpu/max_freq -> target Hz
+                            /sys/class/devfreq/17000000.gpu/min_freq -> target Hz
+  Verification:           Read cur_freq after 2s settle time
+  Baseline:               Governor set to "nvhost_podgov" (dynamic, uncapped)
+
+MEMORY (EMC) FREQUENCY:
+  Controlled:             NO -- left under automatic EMC governor
+  Observed range:         ~2100 -- 3200 MHz (from tegrastats logs)
+  Rationale:              Reflects real-world deployment where memory is auto-managed
+
+
+================================================================================
+SECTION 3.3: MODELS AND DATASETS
+================================================================================
+
+MODELS:
+
+  BERT-tiny (prajjwal1/bert-tiny):
+    Parameters:           14M
+    Layers:               2
+    Hidden size:          128
+    Attention heads:      2
+    Intermediate size:    512
+    Checkpoint:           prajjwal1/bert-tiny (HuggingFace Hub)
+    Precision:            FP16
+    Why included:         Smallest scale; likely CPU-bound due to tiny compute
+                          footprint; establishes lower boundary of model scale
+
+  BERT-base (bert-base-uncased):
+    Parameters:           110M
+    Layers:               12
+    Hidden size:          768
+    Attention heads:      12
+    Intermediate size:    3072
+    Checkpoint:           bert-base-uncased (HuggingFace Hub)
+    Precision:            FP16
+    Why included:         Production-scale model; compute-bound regime;
+                          well-established baseline in NLP literature
+
+  DeBERTa-v2-xlarge (microsoft/deberta-v2-xlarge):
+    Parameters:           900M
+    Layers:               24
+    Hidden size:          1536
+    Attention heads:      24
+    Intermediate size:    6144
+    Checkpoint:           microsoft/deberta-v2-xlarge (HuggingFace Hub)
+    Precision:            FP32 (FP16 disabled -- numerically unstable for DeBERTa-v2)
+    *** IMPORTANT NOTE:   This is deberta-v2-xlarge (900M), NOT deberta-xlarge (v1, ~1.5B)
+                          The checklist says "microsoft/deberta-xlarge" -- this is WRONG.
+                          Correct checkpoint: microsoft/deberta-v2-xlarge
+    Why included:         Large-scale memory-bound model; tests extreme end of
+                          parameter scale on embedded hardware
+
+
+DATASETS:
+
+  SST-2 (Stanford Sentiment Treebank):
+    Task:                 Binary sentiment classification (positive / negative)
+    Training samples:     67,349 (full dataset -- see note below)
+    Validation samples:   ~872
+    Max sequence length:  128 tokens (truncated; SST-2 sentences are short)
+    Classes:              2
+    GLUE config:          glue/sst2
+
+  QNLI (Question Natural Language Inference):
+    Task:                 Binary: does sentence answer the question?
+    Training samples:     104,743 (full dataset -- see note below)
+    Validation samples:   ~5,463
+    Max sequence length:  256 tokens (question+sentence pairs are longer)
+    Classes:              2
+    GLUE config:          glue/qnli
+
+  *** CRITICAL CORRECTION ON N=128 / N=256 ***
+  The checklist says "Training samples used: N=128" and "N=256" -- this is WRONG.
+  N=128 and N=256 refer to max_length (token truncation limit), NOT sample counts.
+  ALL experiments use the FULL training sets:
+    SST-2: 67,349 training samples
+    QNLI:  104,743 training samples
+
+
+================================================================================
+SECTION 3.4: TRAINING CONFIGURATION
+================================================================================
+
+HYPERPARAMETERS (from BERT_sst2_FullFT.py):
+
+  Learning rate:          2e-5 (default for all models)
+                          1e-5 for DeBERTa (passed via --lr 1e-5 flag)
+  Optimizer:              AdamW (HuggingFace Trainer default: adamw_torch)
+  Weight decay:           0.01
+  Warmup:                 Ratio = 0.06 of total training steps (NOT fixed steps)
+                          Warmup steps vary by run:
+                            BERT-base  SST-2  (526 steps):   ~32 warmup steps
+                            BERT-base  QNLI   (818 steps):   ~49 warmup steps
+                            DeBERTa    QNLI  (6546 steps):  ~393 warmup steps
+                            DeBERTa    SST-2 (4209 steps):  ~253 warmup steps
+  Epochs:                 1
+  Gradient accumulation:  1 (HuggingFace default; not explicitly set)
+  Gradient checkpointing: False (disabled for speed)
+  Max gradient norm:      1.0 (HuggingFace Trainer default)
+  Seed:                   42
+
+  BATCH SIZES (vary per model/dataset -- chosen for memory fit):
+    BERT-tiny  SST-2:     512
+    BERT-tiny  QNLI:      256
+    BERT-base  SST-2:     128
+    BERT-base  QNLI:      128
+    DeBERTa    SST-2:      16
+    DeBERTa    QNLI:       16
+
+  MAX SEQUENCE LENGTH:
+    SST-2:  128 tokens
+    QNLI:   256 tokens
+    *** CORRECTION: The checklist value of 512 is WRONG. We use 128 and 256.
+
+  PRECISION:
+    BERT-tiny, BERT-base:  FP16 (mixed precision training)
+    DeBERTa-v2-xlarge:     FP32 (--no-fp16; FP16 causes numerical instability)
+
+FINE-TUNING STRATEGY:
+  Method:    Full fine-tuning (all parameters updated)
+  Framework: HuggingFace Transformers Trainer API (transformers 4.38.2)
+  No PEFT:   BitFit, LoRA, and other parameter-efficient methods NOT used
+
+
+================================================================================
+SECTION 3.5: DVFS CONTROL METHODOLOGY
+================================================================================
+
+GPU FREQUENCY CONTROL:
+  Tool:      Linux devfreq sysfs interface (NOT jetson_clocks, NOT nvpmodel)
+  Script:    run_gpu_freq_experiment_qnli.sh (and per-model variants)
+  Procedure:
+    1. Set governor to "userspace":
+       sudo bash -c "echo userspace > /sys/class/devfreq/17000000.gpu/governor"
+    2. Pin frequency (both max and min to same value):
+       sudo bash -c "echo <freq_hz> > /sys/class/devfreq/17000000.gpu/max_freq"
+       sudo bash -c "echo <freq_hz> > /sys/class/devfreq/17000000.gpu/min_freq"
+    3. Wait 2 seconds for stabilization
+    4. Verify: cat /sys/class/devfreq/17000000.gpu/cur_freq
+  Baseline:  Restore "nvhost_podgov" dynamic governor (uncapped)
+
+FREQUENCY POINTS:
+  Source:    All 11 hardware-supported discrete levels from available_frequencies
+  Rationale: Not user-selected -- these are the only frequencies the hardware supports
+  Spacing:   ~102 MHz per step (hardware-defined, approximately uniform)
+
+CPU FREQUENCY:   NOT controlled (system cpufreq governor, auto)
+EMC FREQUENCY:   NOT controlled (EMC governor, auto, ~2100-3200 MHz observed)
+
+BASELINE CONFIGURATIONS:
+  Mode 0 (MAXN):
+    GPU:          Dynamic governor (nvhost_podgov), observed ~1300 MHz during training
+    Power:        No cap (unconstrained)
+    Purpose:      Maximum performance reference
+
+  Mode 2 (MODE_30W):
+    GPU:          Dynamic governor, constrained by 30W system budget
+    Power:        30W total system cap
+    Purpose:      Default/balanced mode reference
+    Observation:  Significant throughput reduction for large models vs MAXN
+                  (DeBERTa: ~7.7x lower throughput under 30W)
+
+
+================================================================================
+SECTION 3.6: POWER AND ENERGY MEASUREMENT
+================================================================================
+
+TOOL: tegrastats (NVIDIA Jetson system utility)
+  Sampling rate:    10 ms intervals (--interval 10)
+  Output:           Raw text log -> parsed to CSV by parse_tegrastats_labeled.py
+
+POWER CHANNELS MEASURED:
+  VDD_GPU_SOC:      GPU + SoC subsystem power (mW)   <- used in energy calc
+  VDD_CPU_CV:       CPU + CV engine power (mW)        <- used in energy calc
+  VIN_SYS_5V0:      Total 5V system input power (mW)  <- logged but NOT in energy calc
+  Note: Energy uses CPU+GPU channels only, not the full-system VIN_SYS_5V0 rail
+
+OTHER METRICS LOGGED (42 CSV columns total):
+  RAM used/total (MB), swap, CPU load per core (%), CPU freq per core (MHz),
+  EMC utilization (%), EMC freq (MHz), GPU utilization (%), GPU freq (MHz),
+  hardware engine utilizations (nvenc, nvdec, nvjpg, vic, ofa, nvdla, pva),
+  per-zone temperatures (cpu, soc0, soc1, soc2, tj in degC)
+
+ENERGY CALCULATION:
+  Formula:    E (J) = mean(VDD_GPU_SOC + VDD_CPU_CV) [mW] x train_time [s] / 1000
+  Method:     Average power over training window multiplied by wall-clock duration
+              NOTE: Simple mean x time, NOT trapezoidal integration
+  Code:       parse_tegrastats_labeled.py -> compute_derived_metrics()
+              total_power_mw = power_VDD_GPU_SOC_mw + power_VDD_CPU_CV_mw (per sample)
+              energy_j = (total_power_mw * train_time) / 1000.0
+
+TRAINING TIME:
+  Method:     Wall-clock time extracted from Python output log
+              Regex: "Train wall time: <X> s"
+  Units:      Seconds
+
+ACCURACY:
+  Metric:     Classification accuracy (%) on GLUE validation split
+  Evaluation: Single pass after training completes (eval_every_epoch=False)
+  Note:       GLUE test labels not publicly available; validation set used
+
+
+================================================================================
+SECTION 3.7: EXPERIMENTAL PROCEDURE
+================================================================================
+
+PROTOCOL (per model x dataset x frequency):
+  1.  Set GPU governor to "userspace"
+  2.  Pin GPU frequency (max_freq = min_freq = target)
+  3.  Wait 2s, verify cur_freq
+  4.  Check temperature (abort if > 85 degC, wait if > 75 degC)
+  5.  Launch tegrastats --interval 10 --logfile <outdir>/tegrastats_measure.txt
+  6.  Run: python BERT_sst2_FullFT.py --model_name ... --dataset ... [args]
+  7.  Kill tegrastats after training exits
+  8.  Run parse_tegrastats_labeled.py -> CSV + Google Sheets upload
+  9.  Sleep 30-60s cooldown
+
+REPETITIONS:
+  Each configuration run ONCE (no repeated trials)
+  Variance not characterized
+
+EXPERIMENTAL MATRIX:
+  BERT-tiny  x SST-2 x 12 freqs (BASELINE + 11):   12 runs  ~15 min total
+  BERT-tiny  x QNLI  x 12 freqs (BASELINE + 11):   12 runs  ~20 min total
+  BERT-base  x QNLI  x  7 freqs (612-1300 MHz):     7 runs  ~1.5 h total
+  DeBERTa    x QNLI  x  4 freqs (BASELINE+3):        4 runs  ~14 h total
+  Mode 2 baselines (6 model/dataset combos):         8 runs  ~10 h total
+  (including re-runs for fair comparison)
+
+DATA ORGANIZATION:
+  Folder naming:  runs/<experiment_label>_<YYYYMMDD_HHMMSS>/
+  Per-run files:
+    tegrastats_measure.txt    raw tegrastats output
+    tegrastats_parsed.csv     parsed CSV (42 columns)
+    python_output.txt         training stdout
+    events_log.csv            training event markers
+  Aggregated:     Google Sheets (LLM-DVFS-Experiments / Experimental Results)
+                  Uploaded automatically by parser after each run
+
+
+================================================================================
+TABLE FILL-INS (READY TO COPY INTO LATEX)
+================================================================================
+
+Table 3.1: Model Specifications
+  Model            Params  Layers  Hidden  Heads  Intermediate  Checkpoint
+  BERT-tiny        14M     2       128     2      512           prajjwal1/bert-tiny
+  BERT-base        110M    12      768     12     3072          bert-base-uncased
+  DeBERTa-xlarge   900M    24      1536    24     6144          microsoft/deberta-v2-xlarge
+
+Table 3.2: Dataset Characteristics
+  Dataset  Task                   Train samples  Max length   Classes
+  SST-2    Sentiment (binary)     67,349         128 tokens   2
+  QNLI     QA NLI (binary)        104,743        256 tokens   2
+
+Table 3.3: Training Hyperparameters
+  Parameter                BERT-tiny / BERT-base    DeBERTa-xlarge
+  Learning rate            2e-5                     1e-5
+  Optimizer                AdamW                    AdamW
+  Weight decay             0.01                     0.01
+  Warmup                   6% of steps              6% of steps
+  Epochs                   1                        1
+  Gradient accumulation    1                        1
+  Max sequence length      128 (SST-2) / 256 (QNLI) 128 (SST-2) / 256 (QNLI)
+  Precision                FP16                     FP32
+  Batch size (SST-2)       512 (tiny) / 128 (base)  16
+  Batch size (QNLI)        256 (tiny) / 128 (base)  16
+
+Table 3.4: GPU Frequency Points
+  Index  Frequency (MHz)
+  0      306
+  1      408
+  2      510
+  3      612
+  4      714
+  5      816
+  6      918
+  7      1020
+  8      1122
+  9      1224
+  10     1300
+
+Table 3.5: Platform Specifications
+  Component           Specification
+  Platform            NVIDIA Jetson AGX Orin
+  JetPack             R36.4.7 (September 2025)
+  GPU architecture    Ampere GA10B, compute capability 8.7
+  GPU cores           2048 CUDA cores, 64 Tensor cores
+  Memory              64 GB LPDDR5, unified (CPU+GPU shared), 204 GB/s
+  GPU freq range      306 -- 1300 MHz (11 discrete hardware steps)
+  CPU freq range      115 -- 2201 MHz (29 steps; not manually controlled)
+  Power modes         MAXN (uncapped), 15W, 30W, 50W
+  CUDA version        12.6
+  PyTorch version     2.5.0a0 (NVIDIA NV24.08 Jetson build)
+  Transformers        4.38.2
+  OS                  Ubuntu 22.04.5 LTS
+
+
+================================================================================
+KEY CORRECTIONS TO CHECKLIST ASSUMPTIONS
+================================================================================
+
+1. "Training samples used: N=128 / N=256" -- WRONG
+   N=128 and N=256 are max_length (token truncation limit), not sample counts.
+   Full datasets used: 67,349 (SST-2) and 104,743 (QNLI).
+
+2. "Max sequence length: 512" -- WRONG
+   Actual values: 128 for SST-2, 256 for QNLI.
+
+3. "DeBERTa-xlarge: microsoft/deberta-xlarge" -- WRONG
+   Actual: microsoft/deberta-v2-xlarge (v2 architecture, 900M params).
+   microsoft/deberta-xlarge is a different model (v1, larger).
+
+4. "Energy = trapz(P, t)" -- NOT USED
+   Actual: E = mean_power x train_duration (simple product, not integration).
+
+5. "Batch size: 16?" -- ONLY for DeBERTa
+   Batch sizes: 512 (BERT-tiny SST-2), 256 (BERT-tiny QNLI),
+                128 (BERT-base), 16 (DeBERTa both datasets).
+
+6. "Warmup steps: 0 or small number?" -- ratio-based, NOT fixed
+   Warmup = 6% of total steps, so it varies per model/dataset combination.
+
+================================================================================
+END OF FILE
+================================================================================
